@@ -59,6 +59,22 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def forced_reasoning_end_str(self) -> str | None:
+        """Text to force when `thinking_token_budget` is exhausted.
+
+        Defaults to `reasoning_end_str`, which is right whenever the marker
+        that ends reasoning is also a complete instruction to start answering
+        (`</think>`). Override when it is not: a channel-framed model closes
+        its reasoning message and then has to *open* the answer channel, so
+        forcing the closing marker alone would leave the model free to open
+        another reasoning message and keep thinking.
+
+        Kept separate from `reasoning_end_str` so the shorter, natural marker
+        is still what detects the model ending reasoning on its own.
+        """
+        return None
+
     def has_engine_confirmed_reasoning_end(self) -> bool:
         """Whether the engine has confirmed the reasoning end transition.
 

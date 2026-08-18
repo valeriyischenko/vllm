@@ -269,6 +269,12 @@ If `thinking_token_budget` is not specified, no explicit reasoning limit is appl
 !!! note
     `reasoning_end_str` can include a transition phrase before the reasoning end token. For example, setting `reasoning_end_str` to `"I have to give the solution based on the reasoning directly now.</think>"` instructs the model to emit that phrase when the budget is exhausted, making the reasoning termination more natural.
 
+!!! note
+    Both strings must be spelled the way the model *generates* them, because they are matched against output token ids. If the chat template ends the generation prompt in the middle of a line, the first generated token carries the leading whitespace (` to` is not the same token as `to`), and a spelling that differs from the model's is never matched, so the budget silently never applies.
+
+!!! note
+    Models that frame reasoning as a channel rather than a `<think>`/`</think>` pair need two different end strings: the marker that ends reasoning naturally, and the longer text that must be forced to make the model start answering. Their parsers express this with `forced_reasoning_end_str`, and setting `reasoning_end_str` on the command line overrides only the forced one.
+
 ### Online Serving
 
 ```bash
