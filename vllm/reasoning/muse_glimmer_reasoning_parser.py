@@ -15,7 +15,9 @@ Usage: ``--reasoning-parser muse_glimmer``
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, MutableMapping, Sequence
+from functools import cached_property
+from weakref import WeakKeyDictionary
 
 import regex as re
 
@@ -69,10 +71,19 @@ _OPEN_REASONING_RE = re.compile(
 )
 # Markers whose PREFIX could appear at the tail of an OPEN (still-streaming) body.
 _HOLDBACK_MARKERS = (_EOM, _EOT, "<|start|>", "<|message|>")
+# Every channel header ends with this marker (see _CHANNEL_HEADER_RE), so no
+# decode step can open a channel without completing it. That makes it a sound
+# anchor for the O(1) decode-path prefilter in is_reasoning_end_streaming.
+_CHANNEL_MARKER = "<|message|>"
 # A trailing fragment that could still grow into a channel header (" t", " to",
 # " to=", " to=skill"). Without this the recipient name leaks into reasoning and
 # then has to be un-emitted once ``<|message|>`` arrives.
 _OPEN_TAIL_HEADER_RE = re.compile(r"[\s](?:t|to|to=[^\s<]*)$")
+# Scanning the vocabulary for _CHANNEL_MARKER completers costs one pass over
+# ~200k entries, and the structured-output manager builds a request-local parser
+# for every request, so the result is shared per tokenizer. Weak keys let the
+# entry go when the tokenizer does.
+_MARKER_COMPLETER_CACHE: MutableMapping[object, frozenset[int]] = WeakKeyDictionary()
 
 
 def _current_assistant_turn(text: str) -> str:
@@ -122,6 +133,51 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         self._emitted_content: str = ""
         self._tool_handoff_done: bool = False
 
+    @cached_property
+    def _channel_marker_completers(self) -> frozenset[int]:
+        tokenizer = self.model_tokenizer
+        try:
+            cached = _MARKER_COMPLETER_CACHE.get(tokenizer)
+            if cached is None:
+                cached = self._marker_completer_ids(_CHANNEL_MARKER)
+                _MARKER_COMPLETER_CACHE[tokenizer] = cached
+            return cached
+        except TypeError:
+            # Tokenizer not weak-referenceable; correctness does not depend on
+            # the cache.
+            return self._marker_completer_ids(_CHANNEL_MARKER)
+
+    def _marker_completer_ids(self, marker: str) -> frozenset[int]:
+        """Token ids that could supply ``marker``'s final character.
+
+        A decode step can only complete ``marker`` if one of its tokens carries
+        that last character, and the characters before it inside the same token
+        must line up with the marker. So the token's text either starts with a
+        suffix of ``marker`` (it finishes a marker begun earlier) or contains
+        ``marker`` outright. Collecting those ids once turns the decode-path
+        check into a set-membership test over the step's delta.
+
+        This is deliberately not ``vocab[marker]``. The 30B checkpoint happens to
+        have ``<|message|>`` as a special token, so the set is small there, but
+        nothing guarantees that: a checkpoint may spell the marker with ordinary
+        byte-level pieces, and the surrounding header certainly is (2,730 distinct
+        token-id sequences spell ``to=self<|message|>`` in that tokenizer).
+        Overlap-based collection covers every spelling without enumerating any.
+
+        Returns an empty set if the vocabulary is unavailable, which disables
+        the prefilter rather than risking a missed transition.
+        """
+        try:
+            vocab = self.vocab
+        except Exception:
+            return frozenset()
+        suffixes = tuple(marker[i:] for i in range(len(marker)))
+        return frozenset(
+            token_id
+            for text, token_id in vocab.items()
+            if text and (text.startswith(suffixes) or marker in text)
+        )
+
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
@@ -154,6 +210,72 @@ class MuseGlimmerReasoningParser(ReasoningParser):
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
+        """Whether the model has left the reasoning channel, for the grammar.
+
+        This is the predicate the structured-output manager consults on every
+        decode step, and it answers a different question from
+        ``is_reasoning_end``: not "should the tool parser take over" but "may
+        the grammar start masking". Those diverge for MuseGlimmer, because the
+        model can leave reasoning by opening ``to=user`` -- an answer channel
+        this parser keeps for itself. Reporting only tool channels here means a
+        request with a JSON schema and no tool call never reaches
+        ``reasoning_ended``, so ``should_fill_bitmask()`` stays False and the
+        schema is silently dropped. Any non-``self`` channel therefore ends
+        reasoning as far as the grammar is concerned, which puts MuseGlimmer on
+        the same boundary a ``</think>`` model already uses.
+
+        ``is_reasoning_end`` stays tool-only: its callers evaluate it against
+        prompt token ids, and the stream hand-off is now asked separately via
+        ``is_tool_phase_start_streaming``.
+
+        The full predicate needs decoded text -- channel scoping depends on
+        headers earlier in the turn -- and re-decoding the whole sequence once
+        per token per running request made decoding quadratic: measured at 4.9
+        ms in this call alone per step on a 30B checkpoint at concurrency 50,
+        with throughput decaying from 260 to 170 tok/s as sequences grew.
+        Because generated text is append-only and a channel cannot open without
+        completing ``<|message|>``, a step whose delta carries no token that
+        could complete that marker cannot be the step this flips on, and is
+        rejected in O(len(delta_ids)) without decoding anything.
+
+        The result is therefore not monotonic: after the transition a later
+        step may answer False again. Callers latch the first True --
+        ``StructuredOutputManager.should_advance`` sets ``reasoning_ended`` --
+        and what this guarantees is that no False-to-True transition of the
+        underlying text predicate is ever skipped.
+        """
+        completers = self._channel_marker_completers
+        if completers:
+            saw_delta = False
+            saw_completer = False
+            for token_id in delta_ids:
+                saw_delta = True
+                if token_id in completers:
+                    saw_completer = True
+                    break
+            # An empty delta carries no new text to judge, so fall through to
+            # the full predicate rather than assuming False.
+            if saw_delta and not saw_completer:
+                return False
+        try:
+            text = self.model_tokenizer.decode(input_ids)
+        except Exception:
+            return False
+        return self._opens_non_self_channel(text)
+
+    def is_tool_phase_start_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        """Only a real tool channel hands the stream to the tool parser.
+
+        A ``to=user`` answer must not: the ATEM tool parser would see a bare
+        ``<|message|>``, classify it as the content channel and leak framing
+        into ``content``. This parser surfaces that body itself.
+
+        Left as the full-sequence check on purpose. It runs in the frontend,
+        once per streamed chunk for one request, not in EngineCore's batched
+        step loop, so it is not the path that made decoding quadratic.
+        """
         return self.is_reasoning_end(list(input_ids))
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
@@ -167,6 +289,19 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         scoped = _current_assistant_turn(text)
         scoped = _STRIP_REASONING_RE.sub("", scoped)
         return _STRIP_OPEN_REASONING_RE.sub("", scoped)
+
+    @classmethod
+    def _opens_non_self_channel(cls, text: str) -> bool:
+        """Whether the turn has opened any channel other than ``to=self``.
+
+        Reasoning spans are stripped first, so a header MuseGlimmer merely
+        quotes inside its own chain-of-thought does not count.
+        """
+        scoped = cls._scoped_turn(text)
+        return any(
+            match.group("recipient") != "self"
+            for match in _CHANNEL_HEADER_RE.finditer(scoped)
+        )
 
     @classmethod
     def _tool_channel_remainder(cls, text: str) -> str:
