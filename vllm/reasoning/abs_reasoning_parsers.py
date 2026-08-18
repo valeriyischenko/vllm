@@ -112,6 +112,33 @@ class ReasoningParser:
         """
         return self.is_reasoning_end(input_ids)
 
+    def is_tool_phase_start_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        """Check whether the stream should hand off to the tool parser.
+
+        `DelegatingParser.parse_delta` asks this to decide when to leave the
+        reasoning phase; the structured-output manager asks
+        `is_reasoning_end_streaming` to decide when the grammar may start
+        masking. For a model that frames its answer as plain text after a
+        `</think>`-style marker the two moments coincide, so the default here
+        is to reuse the same answer and no parser needs to override it.
+
+        Override only when a model can leave reasoning *without* handing the
+        stream over -- e.g. a channel-framed model whose answer channel is
+        still owned by the reasoning parser, where the grammar must start at
+        the answer but the tool parser must not be given the answer body.
+
+        Args:
+            input_ids: The entire model output.
+            delta_ids: The last few computed tokens of the model output at the
+                current decode step.
+
+        Returns:
+            bool: True if the tool parser should take over the stream.
+        """
+        return self.is_reasoning_end_streaming(input_ids, delta_ids)
+
     @abstractmethod
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

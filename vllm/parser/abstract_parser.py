@@ -208,6 +208,26 @@ class Parser:
         """
         return self.is_reasoning_end(input_ids)
 
+    def is_tool_phase_start_streaming(
+        self, input_ids: list[int], delta_ids: list[int]
+    ) -> bool:
+        """
+        Check whether the stream should hand off to the tool parser.
+
+        Distinct from `is_reasoning_end_streaming`, which gates the structured
+        output grammar. The two coincide unless a model can leave reasoning
+        without giving up the stream (see
+        `ReasoningParser.is_tool_phase_start_streaming`).
+
+        Args:
+            input_ids: The entire model output token IDs.
+            delta_ids: The last few computed tokens at the current decode step.
+
+        Returns:
+            True if the tool parser should take over the stream.
+        """
+        return self.is_reasoning_end_streaming(input_ids, delta_ids)
+
     @abstractmethod
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """
@@ -734,6 +754,15 @@ class DelegatingParser(Parser):
             return False
         return self._reasoning_parser.is_reasoning_end_streaming(input_ids, delta_ids)
 
+    def is_tool_phase_start_streaming(
+        self, input_ids: list[int], delta_ids: list[int]
+    ) -> bool:
+        if self._reasoning_parser is None:
+            return False
+        return self._reasoning_parser.is_tool_phase_start_streaming(
+            input_ids, delta_ids
+        )
+
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         if self._reasoning_parser is None:
             return input_ids
@@ -848,7 +877,13 @@ class DelegatingParser(Parser):
                     reasoning_parser.has_engine_confirmed_reasoning_end()
                 )
             else:
-                should_transition = self.is_reasoning_end_streaming(
+                # NOT is_reasoning_end_streaming: that one gates the structured
+                # output grammar, which may start at an answer the reasoning
+                # parser still owns. This asks the narrower question of whether
+                # the tool parser should take over. The base implementation
+                # forwards to is_reasoning_end_streaming, so parsers that do not
+                # distinguish the two are unaffected.
+                should_transition = self.is_tool_phase_start_streaming(
                     current_token_ids, delta_token_ids
                 )
             if should_transition:
