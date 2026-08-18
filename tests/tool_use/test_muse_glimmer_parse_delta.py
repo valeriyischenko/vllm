@@ -181,6 +181,66 @@ def test_parse_delta_reasoning_suppressed_when_not_requested(parser_cls, tok):
     _assert_no_framing(content)
 
 
+def test_grammar_gate_opens_at_the_answer_channel(tok):
+    """The predicate the structured-output manager reads must fire on `to=user`.
+
+    While it reported tool channels only, a schema-constrained request that made
+    no tool call never reached `reasoning_ended`: the bitmask was never filled
+    and the model answered in prose (observed as fenced ```json blocks from a
+    run with `structured_outputs` set). Asserted on real token ids because the
+    decode-path prefilter is vocabulary-dependent.
+    """
+    from vllm.reasoning.muse_glimmer_reasoning_parser import (
+        MuseGlimmerReasoningParser,
+    )
+
+    parser = MuseGlimmerReasoningParser(tok)
+    header = " to=user<|message|>"
+    gen = (
+        " to=self<|message|>thinking about the schema<|eom|>"
+        f"<|start|>assistant{header}" + '{"answer": 42}<|eot|>'
+    )
+    ids = tok.encode(gen, add_special_tokens=False)
+
+    fired = None
+    for i in range(len(ids)):
+        if parser.is_reasoning_end_streaming(ids[: i + 1], ids[i : i + 1]):
+            fired = i
+            break
+    assert fired is not None, "gate never opened: the schema would be dropped"
+    # Token boundaries vary, so pin the boundary by decoded text rather than by
+    # index: the header must be complete at `fired` and not before it.
+    assert header in tok.decode(ids[: fired + 1])
+    assert header not in tok.decode(ids[:fired])
+    # The tool hand-off must still not fire for an answer channel.
+    assert not parser.is_reasoning_end(ids)
+
+
+def test_grammar_gate_prefilter_never_misses_a_transition(tok):
+    """Real vocabulary: no False->True step of the text predicate is skipped."""
+    from vllm.reasoning.muse_glimmer_reasoning_parser import (
+        MuseGlimmerReasoningParser,
+    )
+
+    parser = MuseGlimmerReasoningParser(tok)
+    ids = tok.encode(
+        " to=self<|message|>first thought<|eom|>"
+        "<|start|>assistant to=self<|message|>second thought, quoting"
+        " to=user<|message|> as text<|eom|>"
+        "<|start|>assistant to=user<|message|>done<|eot|>",
+        add_special_tokens=False,
+    )
+    previous = False
+    for i in range(len(ids)):
+        prefix = ids[: i + 1]
+        reference = parser._opens_non_self_channel(tok.decode(prefix))
+        got = parser.is_reasoning_end_streaming(prefix, ids[i : i + 1])
+        if reference and not previous:
+            assert got, f"missed transition at {i}: {tok.decode(prefix)!r}"
+        assert not got or reference, f"false positive at {i}"
+        previous = reference
+
+
 if __name__ == "__main__":
     import sys
 
