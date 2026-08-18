@@ -90,8 +90,12 @@ class ReasoningConfig:
                 reasoning_start_str = start_token
 
             end_token = reasoning_parser.reasoning_end_str
-            if end_token and not reasoning_end_str:
-                reasoning_end_str = end_token
+            # A parser may distinguish the marker that ends reasoning from the
+            # text that must be forced to get the model answering; see
+            # `ReasoningParser.forced_reasoning_end_str`.
+            forced_end_token = reasoning_parser.forced_reasoning_end_str or end_token
+            if forced_end_token and not reasoning_end_str:
+                reasoning_end_str = forced_end_token
             natural_reasoning_end_str = end_token or ""
 
         if not natural_reasoning_end_str:
