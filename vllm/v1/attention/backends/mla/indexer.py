@@ -157,8 +157,11 @@ class DeepseekV32IndexerBackend(AttentionBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # Only the varlen paged MQA logits kernel takes per-request query
-        # lengths from device tensors; otherwise the indexer needs uniform ones.
-        return _supports_varlen_paged_mqa_logits()
+        # lengths from device tensors natively. Hopper can instead flatten each
+        # query into a single-token row using device-built metadata.
+        return _supports_varlen_paged_mqa_logits() or (
+            _supports_flattened_device_query_lens()
+        )
 
     @staticmethod
     def get_name() -> str:
@@ -493,6 +496,14 @@ def _supports_varlen_paged_mqa_logits() -> bool:
     )
 
 
+def _supports_flattened_device_query_lens() -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(90)
+        and has_deep_gemm()
+    )
+
+
 def _supports_native_decode(next_n: int) -> bool:
     """Whether decode can pass `next_n` Q rows per request to the kernel
     instead of flattening to one single-token row per query, which re-reads
@@ -507,6 +518,18 @@ def _supports_native_decode(next_n: int) -> bool:
     return next_n in (1, 2)
 
 
+def _adaptive_verification_enabled(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return bool(speculative_config and speculative_config.enable_adaptive_verification)
+
+
+def _use_flattening(vllm_config: VllmConfig, next_n: int) -> bool:
+    return not _supports_native_decode(next_n) or (
+        _adaptive_verification_enabled(vllm_config)
+        and _supports_flattened_device_query_lens()
+    )
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # The indexer opts out of the shared reorder-threshold vote (see __init__),
     # so this is None; its own split uses self.decode_threshold.
@@ -519,7 +542,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        if _supports_varlen_paged_mqa_logits():
+        if _supports_varlen_paged_mqa_logits() or (
+            _adaptive_verification_enabled(vllm_config)
+            and _supports_flattened_device_query_lens()
+        ):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
@@ -553,7 +579,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
         self.reorder_batch_threshold = None
-        self.use_flattening = not _supports_native_decode(next_n)
+        self.use_flattening = _use_flattening(self.vllm_config, next_n)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
@@ -679,6 +705,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             assert self.decode_seq_lens_buffer.dim() == 1
             if (
                 not self.supports_varlen
+                and (
+                    num_decodes == 1
+                    or not _adaptive_verification_enabled(self.vllm_config)
+                )
                 and min_decode_len == max_decode_len
                 and num_decodes * max_decode_len == num_decode_tokens
             ):
