@@ -88,6 +88,21 @@ _OPEN_TAIL_HEADER_RE = re.compile(r"[\s](?:t|to|to=[^\s<]*)$")
 # for every request, so the result is shared per tokenizer. Weak keys let the
 # entry go when the tokenizer does.
 _MARKER_COMPLETER_CACHE: MutableMapping[object, frozenset[int]] = WeakKeyDictionary()
+# What the model GENERATES to open its reasoning channel, leading space and all.
+# The chat template renders the assistant header as
+# ``<|start|>assistant to=self<|message|>`` and ends the generation prompt after
+# ``<|start|>assistant``, so the space belongs to the first generated token: the
+# model emits `` to``, not ``to``, and the two are different ids. Every id-level
+# consumer needs this spelling -- ``thinking_token_budget`` matches these ids
+# against the output by exact slice and silently never fires if they differ.
+_GENERATED_REASONING_OPEN = " to=self<|message|>"
+# ``<|eom|>`` alone closes the reasoning message but does not make the model
+# answer: it would be free to open another ``to=self``. Force the answer channel
+# open too, exactly as the model would write it.
+_FORCED_ANSWER_OPEN = "<|eom|><|start|>assistant to=user<|message|>"
+# Tokens decoded before a ``<|message|>`` to recover its recipient. A header is
+# ``to=<recipient><|message|>``; 8 tokens covers namespaced tool names.
+_HEADER_LOOKBACK = 8
 
 
 def _current_assistant_turn(text: str) -> str:
@@ -194,6 +209,74 @@ class MuseGlimmerReasoningParser(ReasoningParser):
             for text, token_id in vocab.items()
             if text and (text.startswith(suffixes) or marker in text)
         )
+
+    @property
+    def reasoning_start_str(self) -> str:
+        """Opens a reasoning message; see ``_GENERATED_REASONING_OPEN``.
+
+        Declaring this and ``reasoning_end_str`` is what lets
+        ``ReasoningConfig.initialize_token_ids`` enable
+        ``thinking_token_budget`` for MuseGlimmer. Without them the config
+        returns early, ``reasoning_config.enabled`` stays False and a budget
+        passed on a request is accepted and then ignored.
+        """
+        return _GENERATED_REASONING_OPEN
+
+    @property
+    def reasoning_end_str(self) -> str:
+        """The marker that ends a reasoning message, and only that.
+
+        Kept minimal because this is what detects the model leaving reasoning by
+        itself. A single special token matches reliably; the longer transition
+        that has to be *forced* is ``forced_reasoning_end_str``.
+        """
+        return _EOM
+
+    @property
+    def forced_reasoning_end_str(self) -> str:
+        """See ``_FORCED_ANSWER_OPEN``."""
+        return _FORCED_ANSWER_OPEN
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count the tokens inside ``to=self`` channels.
+
+        Without this MuseGlimmer reports ``reasoning_tokens: 0`` on every
+        response. There is no single start token to key on -- what opens a
+        reasoning message is the recipient in front of ``<|message|>`` -- so the
+        few tokens ahead of each marker are decoded to recover it. Bodies are
+        never decoded, and several reasoning messages in one turn are summed.
+
+        Returns 0, as the base class does, if the framing markers are not single
+        tokens in this checkpoint's vocabulary.
+        """
+        try:
+            vocab = self.vocab
+        except Exception:
+            return 0
+        message_id = vocab.get("<|message|>")
+        if message_id is None:
+            return 0
+        terminators = {
+            token_id
+            for token_id in (vocab.get(_EOM), vocab.get(_EOT))
+            if token_id is not None
+        }
+        ids = list(token_ids)
+        count = 0
+        in_reasoning = False
+        for index, token_id in enumerate(ids):
+            if token_id == message_id:
+                window = ids[max(0, index - _HEADER_LOOKBACK) : index]
+                try:
+                    header = self.model_tokenizer.decode(window)
+                except Exception:
+                    return 0
+                in_reasoning = header.endswith("to=self")
+            elif token_id in terminators:
+                in_reasoning = False
+            elif in_reasoning:
+                count += 1
+        return count
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
