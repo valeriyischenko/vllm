@@ -75,6 +75,26 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def reasoning_budget_is_cumulative(self) -> bool:
+        """Whether `thinking_token_budget` bounds the turn or one reasoning block.
+
+        Default False keeps the historical meaning: the budget applies to the
+        current block and the counter restarts at the next one. For a
+        `<think>`/`</think>` model the two readings coincide, because a turn
+        holds exactly one block.
+
+        Override to True for a model that reasons in several blocks per turn,
+        where the per-block reading makes the budget unenforceable: each new
+        block draws a fresh allowance, so N blocks cost N times the budget and
+        no finite setting bounds the turn.
+
+        Only tokens the model generates are counted either way, so the budget
+        stays scoped to the current turn and reasoning already in the prompt --
+        few-shot examples, earlier turns of a conversation -- never consumes it.
+        """
+        return False
+
     def has_engine_confirmed_reasoning_end(self) -> bool:
         """Whether the engine has confirmed the reasoning end transition.
 

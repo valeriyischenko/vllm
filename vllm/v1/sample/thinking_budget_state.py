@@ -56,11 +56,15 @@ class ThinkingBudgetStateHolder:
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
+            self.budget_is_cumulative = False
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
+            self.budget_is_cumulative = getattr(
+                reasoning_config, "budget_is_cumulative", False
+            )
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -225,7 +229,76 @@ class ThinkingBudgetStateHolder:
             "bonus_token_forced": False,
             "continue_thinking": continue_thinking,
             "scan_offset": 0,
+            "budget_ceiling": thinking_token_budget,
+            "spent_in_closed_blocks": 0,
+            "cumulative_scan_pos": 0,
+            # A prompt that stops mid-block means generation resumes inside it,
+            # so the walk starts in-block and carries the prompt-side tokens.
+            # They are billed only when that block closes; until then the block
+            # is in flight and `continue_thinking` accounts for it, so seeding
+            # the count here does not charge it twice.
+            "cumulative_in_think": in_think,
+            "cumulative_block_count": think_count,
         }
+
+    def _charge_closed_blocks(self, state: dict[str, Any]) -> None:
+        """Bill reasoning blocks the model has already closed against the budget.
+
+        The rest of this class counts the block currently being generated and
+        restarts at zero once it closes, which for a model that reasons in one
+        block per turn is the same thing as counting the turn. It is not the
+        same for a model that opens several: each new block would draw a fresh
+        allowance, so no finite budget bounds the turn.
+
+        This walks the generated tokens once, keeping a running total of the
+        blocks that have closed, and lowers `thinking_token_budget` -- the
+        allowance the per-block machinery works against -- by that total. The
+        block in flight is left to that machinery, so nothing is counted twice,
+        and once the total reaches the ceiling the allowance is zero and any
+        further block is ended as soon as it opens.
+
+        Only generated tokens are walked, so reasoning that arrived in the
+        prompt is not billed here; a prompt that stops mid-block is handled by
+        `continue_thinking` in `_init_state_entry`.
+        """
+        ceiling = state.get("budget_ceiling")
+        if ceiling is None:
+            return
+        start_ids = self.think_start_token_ids
+        end_ids = self.think_end_token_ids
+        output = state.get("output_tok_ids") or []
+        # A start or end sequence straddling the end of what has been generated
+        # is not decidable yet, so stop short of one and pick it up next step.
+        limit = len(output) - max(len(start_ids), len(end_ids)) + 1
+        i = state["cumulative_scan_pos"]
+        in_think = state["cumulative_in_think"]
+        block = state["cumulative_block_count"]
+        spent = state["spent_in_closed_blocks"]
+        while i < limit:
+            if start_ids and output[i : i + len(start_ids)] == start_ids:
+                in_think, block, i = True, 0, i + len(start_ids)
+                continue
+            if end_ids and output[i : i + len(end_ids)] == end_ids:
+                if in_think:
+                    spent += block
+                in_think, block, i = False, 0, i + len(end_ids)
+                continue
+            if in_think:
+                block += 1
+            i += 1
+        state["cumulative_scan_pos"] = max(i, state["cumulative_scan_pos"])
+        state["cumulative_in_think"] = in_think
+        state["cumulative_block_count"] = block
+        state["spent_in_closed_blocks"] = spent
+        allowance = max(0, ceiling - spent)
+        state["thinking_token_budget"] = allowance
+        # `check_count_down` is how far the cheap path may run before the exact
+        # count is recomputed, and it was seeded from the allowance as it stood
+        # when the block opened. A block closing since then lowers the
+        # allowance, so the countdown has to follow it down or the exact check
+        # arrives after the budget is already overspent.
+        if state["check_count_down"] > allowance:
+            state["check_count_down"] = allowance
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
         if state.get("thinking_token_budget", -1) == -1:
@@ -235,6 +308,8 @@ class ThinkingBudgetStateHolder:
             state["in_end"] = False
             state["force_index"] = []
             return
+        if self.budget_is_cumulative:
+            self._charge_closed_blocks(state)
 
         if state["start_thinking"] == -1:
             scan_offset = state.get("scan_offset", 0)

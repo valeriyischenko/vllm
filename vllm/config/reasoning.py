@@ -44,6 +44,17 @@ class ReasoningConfig:
     """Private field indicating whether reasoning token IDs have been initialized.
     Set to True by `initialize_token_ids` once token IDs are initialized."""
 
+    _budget_is_cumulative: bool = field(default=False, init=False, repr=False)
+    """Whether `thinking_token_budget` bounds the whole turn rather than one
+    reasoning block. Taken from `ReasoningParser.reasoning_budget_is_cumulative`
+    by `initialize_token_ids`. Not intended to be configured directly."""
+
+    @property
+    def budget_is_cumulative(self) -> bool:
+        """Whether `thinking_token_budget` covers every reasoning block in the
+        turn. See `ReasoningParser.reasoning_budget_is_cumulative`."""
+        return self._budget_is_cumulative
+
     @property
     def enabled(self) -> bool:
         """Returns True if reasoning is enabled (i.e. if token IDs have been
@@ -97,6 +108,7 @@ class ReasoningConfig:
             if forced_end_token and not reasoning_end_str:
                 reasoning_end_str = forced_end_token
             natural_reasoning_end_str = end_token or ""
+            self._budget_is_cumulative = reasoning_parser.reasoning_budget_is_cumulative
 
         if not natural_reasoning_end_str:
             natural_reasoning_end_str = reasoning_end_str

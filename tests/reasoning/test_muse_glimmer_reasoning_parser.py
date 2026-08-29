@@ -69,17 +69,17 @@ def test_boundary_strings_are_what_the_model_generates(parser):
     # `<|start|>assistant`, so the model emits ` to`, a different token from `to`,
     # and the budget matcher compares token ids by exact slice.
     assert parser.reasoning_start_str == " to=self<|message|>"
-    # Natural end: the closing marker only, so it matches reliably.
+    # The closing marker ends reasoning and is also what gets forced. Extending
+    # the forced string to `<|eom|><|start|>assistant to=user<|message|>` would
+    # not end reasoning, it would *route*: with one tool offered and a budget of
+    # 8 or 32 tokens it sent 10 of 12 samples to the user instead of the tool,
+    # and those answers fabricated the data the tool was to return.
     assert parser.reasoning_end_str == "<|eom|>"
-    # Forced end: closing the message is not enough, the model would be free to
-    # open another `to=self`, so the answer channel is opened as well.
-    assert parser.forced_reasoning_end_str == (
-        "<|eom|><|start|>assistant to=user<|message|>"
-    )
+    assert parser.forced_reasoning_end_str is None
 
 
-def test_reasoning_config_separates_forced_and_natural_ends(tok, monkeypatch):
-    """`thinking_token_budget` must be enabled, and with the right two strings."""
+def test_reasoning_config_forces_only_the_reasoning_end(tok, monkeypatch):
+    """`thinking_token_budget` must be enabled, and force the bare marker."""
     from vllm.config import reasoning as reasoning_module
     from vllm.config.reasoning import ReasoningConfig
 
@@ -91,10 +91,11 @@ def test_reasoning_config_separates_forced_and_natural_ends(tok, monkeypatch):
 
     assert config.enabled, "a thinking_token_budget would be accepted then ignored"
     assert config.reasoning_start_token_ids == tok.encode(" to=self<|message|>")
-    assert config.reasoning_end_token_ids == tok.encode(
-        "<|eom|><|start|>assistant to=user<|message|>"
-    )
+    assert config.reasoning_end_token_ids == tok.encode("<|eom|>")
     assert config.natural_reasoning_end_token_ids == tok.encode("<|eom|>")
+    # What keeps re-entry into `to=self` bounded now that the forced string no
+    # longer routes: the budget covers the turn, not one reasoning message.
+    assert config.budget_is_cumulative
 
 
 def _ids(tok, text):

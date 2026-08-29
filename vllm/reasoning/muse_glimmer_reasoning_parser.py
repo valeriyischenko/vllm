@@ -96,10 +96,6 @@ _MARKER_COMPLETER_CACHE: MutableMapping[object, frozenset[int]] = WeakKeyDiction
 # consumer needs this spelling -- ``thinking_token_budget`` matches these ids
 # against the output by exact slice and silently never fires if they differ.
 _GENERATED_REASONING_OPEN = " to=self<|message|>"
-# ``<|eom|>`` alone closes the reasoning message but does not make the model
-# answer: it would be free to open another ``to=self``. Force the answer channel
-# open too, exactly as the model would write it.
-_FORCED_ANSWER_OPEN = "<|eom|><|start|>assistant to=user<|message|>"
 # Tokens decoded before a ``<|message|>`` to recover its recipient. A header is
 # ``to=<recipient><|message|>``; 8 tokens covers namespaced tool names.
 _HEADER_LOOKBACK = 8
@@ -226,16 +222,37 @@ class MuseGlimmerReasoningParser(ReasoningParser):
     def reasoning_end_str(self) -> str:
         """The marker that ends a reasoning message, and only that.
 
-        Kept minimal because this is what detects the model leaving reasoning by
-        itself. A single special token matches reliably; the longer transition
-        that has to be *forced* is ``forced_reasoning_end_str``.
+        Also what gets forced when the budget runs out: MuseGlimmer must NOT
+        override ``forced_reasoning_end_str``. Forcing the full transition
+        ``<|eom|><|start|>assistant to=user<|message|>`` looks natural -- it is
+        exactly what the model writes to start answering -- but in this
+        protocol the reasoning end and the next recipient are one string, so
+        forcing it does not end reasoning, it *routes*. Measured with one tool
+        offered and a budget of 8 or 32 tokens, it sent 10 of 12 samples to the
+        user instead of the tool and the answers fabricated the data the tool
+        was supposed to return; the no-budget control chose the tool 6 of 6.
+        Any probe without a tool offered is blind to this.
+
+        Forcing the bare marker leaves the recipient to the model, which is
+        where the decision belongs, and re-entry into ``to=self`` was 0 of 8
+        without tools and 0 of 6 with them. Re-entry is bounded regardless
+        because the budget counts the whole turn, not one message; see
+        ``reasoning_budget_is_cumulative``.
         """
         return _EOM
 
     @property
-    def forced_reasoning_end_str(self) -> str:
-        """See ``_FORCED_ANSWER_OPEN``."""
-        return _FORCED_ANSWER_OPEN
+    def reasoning_budget_is_cumulative(self) -> bool:
+        """One turn, many ``to=self`` messages, one budget across all of them.
+
+        MuseGlimmer reasons in as many messages as it likes before answering,
+        each opened by its own header and closed by ``<|eom|>``. Charging the
+        budget per message would leave it unenforceable -- five messages of
+        3000 tokens never reach a 3000-token budget -- and would make forcing
+        the bare ``<|eom|>`` pointless, since the model could simply open
+        another reasoning message and keep going.
+        """
+        return True
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         """Count the tokens inside ``to=self`` channels.
